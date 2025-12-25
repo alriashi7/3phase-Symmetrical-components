@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>محاكي الأعطال - مع نقاط التقاط دائمة</title>
+    <style>
+        body { font-family: sans-serif; background-color: #e0e0e0; display: flex; height: 100vh; margin: 0; overflow: hidden; }
+        #sidebar { width: 320px; background: #ccc; padding: 15px; border-left: 2px solid #999; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+        #main-content { flex-grow: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 15px; padding: 15px; background: white; }
+        .chart-container { border: 2px solid #ddd; position: relative; background: #fdfdfd; cursor: crosshair; border-radius: 8px; }
+        .chart-title { position: absolute; top: 8px; right: 12px; font-weight: bold; color: #333; pointer-events: none; font-size: 14px; background: rgba(255,255,255,0.8); padding: 2px 8px; border-radius: 4px; z-index: 10; }
+        canvas { width: 100%; height: 100%; }
+        .input-group { background: #ddd; padding: 8px; border-radius: 4px; border: 1px solid #bbb; }
+        input[type="number"] { width: 70px; padding: 4px; font-size: 14px; }
+        label { display: inline-block; width: 40px; font-weight: bold; }
+        .btn-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+        button { padding: 12px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; transition: 0.3s; font-size: 14px; }
+        .btn-reset { background-color: #27ae60; color: white; border-bottom: 4px solid #1e8449; margin-bottom: 10px; }
+        .btn-fault { background-color: #e74c3c; color: white; }
+        button:hover { opacity: 0.9; }
+        button:active { transform: translateY(2px); border-bottom: none; }
+        #results { font-size: 14px; color: #111; margin-top: auto; background: #f0f0f0; padding: 12px; border: 1px solid #bbb; border-radius: 6px; line-height: 1.8; }
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <button class="btn-reset" onclick="resetToBalanced()">إعادة الوضع المتزن (Reset)</button>
+    <h4>سيناريوهات الأعطال</h4>
+    <div class="btn-group">
+        <button class="btn-fault" onclick="applyFault('LG')">عطل فازة مع الأرض (A-G)</button>
+        <button class="btn-fault" onclick="applyFault('LL')">عطل فازة مع فازة (B-C)</button>
+        <button class="btn-fault" onclick="applyFault('LLG')">عطل فازتين مع الأرض (BC-G)</button>
+        <button class="btn-fault" onclick="applyFault('3PH')">عطل ثلاثي متزن (3-Phase)</button>
+    </div>
+    <h4>القيم اللحظية</h4>
+    <div class="input-group"><label>Va:</label> <input type="number" id="va_m"> ∠ <input type="number" id="va_a">°</div>
+    <div class="input-group"><label>Vb:</label> <input type="number" id="vb_m"> ∠ <input type="number" id="vb_a">°</div>
+    <div class="input-group"><label>Vc:</label> <input type="number" id="vc_m"> ∠ <input type="number" id="vc_a">°</div>
+    <div id="results"></div>
+</div>
+
+<div id="main-content">
+    <div class="chart-container"><div class="chart-title">القيم الفعلية (المحصلة بالأحمر)</div><canvas id="canvasPhase"></canvas></div>
+    <div class="chart-container"><div class="chart-title">المتتابعة الموجبة (Positive)</div><canvas id="canvasPos"></canvas></div>
+    <div class="chart-container"><div class="chart-title">المتتابعة السالبة (Negative)</div><canvas id="canvasNeg"></canvas></div>
+    <div class="chart-container"><div class="chart-title">المتتابعة الصفرية (Zero)</div><canvas id="canvasZero"></canvas></div>
+</div>
+
+<script>
+    let isDragging = false, dragTarget = null, dragMode = null; 
+    const maxVoltageForScale = 250; 
+    const a_op = {re: -0.5, im: 0.866}, a2_op = {re: -0.5, im: -0.866};
+    const UNIFORM_WIDTH = 2.25; 
+    let scale = 0;
+
+    const COLOR_ZERO = 'black';
+    const COLOR_POS = 'orange';
+    const COLOR_NEG = 'green';
+    const COLOR_FINAL = 'red';
+
+    let phases = { va: {mag:230, deg:90}, vb: {mag:230, deg:-30}, vc: {mag:230, deg:210} };
+    let seq = { v0: {re:0, im:0}, v1: {re:0, im:0}, v2: {re:0, im:0} };
+
+    function init() {
+        const ids = ['canvasPhase', 'canvasPos', 'canvasNeg', 'canvasZero'];
+        ids.forEach(id => {
+            const cvs = document.getElementById(id);
+            cvs.addEventListener('mousedown', e => startDrag(e, id));
+            cvs.addEventListener('mousemove', drag);
+        });
+        window.addEventListener('mouseup', () => { isDragging = false; dragTarget = null; dragMode = null; });
+        window.addEventListener('resize', resize);
+        ['va_m','va_a','vb_m','vb_a','vc_m','vc_a'].forEach(id => document.getElementById(id).addEventListener('input', updateFromInputs));
+        resize();
+        resetToBalanced(); 
+    }
+
+    function toRect(mag, deg) { const r = deg * Math.PI/180; return {re: mag*Math.cos(r), im: mag*Math.sin(r)}; }
+    function toPol(re, im) { return {mag: Math.hypot(re, im), deg: Math.atan2(im, re)*180/Math.PI}; }
+    function add(c1, c2) { return {re: c1.re + c2.re, im: c1.im + c2.im}; }
+    function mult(c1, c2) { return {re: c1.re*c2.re - c1.im*c2.im, im: c1.re*c2.im + c1.im*c2.re}; }
+
+    function calculateSequences() {
+        const Va = toRect(phases.va.mag, phases.va.deg), Vb = toRect(phases.vb.mag, phases.vb.deg), Vc = toRect(phases.vc.mag, phases.vc.deg);
+        seq.v0 = {re: (Va.re+Vb.re+Vc.re)/3, im: (Va.im+Vb.im+Vc.im)/3};
+        seq.v1 = {re: (Va.re + mult(a_op, Vb).re + mult(a2_op, Vc).re)/3, im: (Va.im + mult(a_op, Vb).im + mult(a2_op, Vc).im)/3};
+        seq.v2 = {re: (Va.re + mult(a2_op, Vb).re + mult(a_op, Vc).re)/3, im: (Va.im + mult(a2_op, Vb).im + mult(a_op, Vc).im)/3};
+    }
+
+    function updatePhasesFromSeq() {
+        const Va = add(seq.v0, add(seq.v1, seq.v2));
+        const Vb = add(seq.v0, add(mult(a2_op, seq.v1), mult(a_op, seq.v2)));
+        const Vc = add(seq.v0, add(mult(a_op, seq.v1), mult(a2_op, seq.v2)));
+        phases.va = toPol(Va.re, Va.im); phases.vb = toPol(Vb.re, Vb.im); phases.vc = toPol(Vc.re, Vc.im);
+    }
+
+    function startDrag(e, canvasId) {
+        const rect = e.target.getBoundingClientRect();
+        const x = e.clientX - rect.left - e.target.width/2, y = e.clientY - rect.top - e.target.height/2;
+        isDragging = true; dragMode = canvasId;
+        
+        if(canvasId === 'canvasPhase') {
+            for(let p in phases) {
+                const pt = toRect(phases[p].mag, phases[p].deg);
+                if(Math.hypot(x - pt.re*scale, y + pt.im*scale) < 25) { dragTarget = p; return; }
+            }
+        } else {
+            const targetSeq = canvasId === 'canvasPos' ? seq.v1 : (canvasId === 'canvasNeg' ? seq.v2 : seq.v0);
+            // السماح بالالتقاط حتى لو القيمة صفر (بالنقر على المركز)
+            if(Math.hypot(x - targetSeq.re*scale, y + targetSeq.im*scale) < 25) { dragTarget = canvasId; return; }
+        }
+        isDragging = false;
+    }
+
+    function drag(e) {
+        if(!isDragging || !dragTarget) return;
+        const rect = e.target.getBoundingClientRect();
+        const x = (e.clientX - rect.left - e.target.width/2)/scale, y = -(e.clientY - rect.top - e.target.height/2)/scale;
+        if(dragMode === 'canvasPhase') {
+            phases[dragTarget] = toPol(x, y);
+            calculateSequences();
+        } else {
+            if(dragMode === 'canvasPos') seq.v1 = {re:x, im:y};
+            else if(dragMode === 'canvasNeg') seq.v2 = {re:x, im:y};
+            else if(dragMode === 'canvasZero') seq.v0 = {re:x, im:y};
+            updatePhasesFromSeq();
+        }
+        update();
+    }
+
+    function drawHandle(ctx, x, y, color) {
+        ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI*2);
+        ctx.strokeStyle = color || "rgba(0,0,0,0.15)"; 
+        ctx.lineWidth = 1; ctx.stroke();
+    }
+
+    function update() {
+        syncInputs();
+        const cPh = document.getElementById('canvasPhase'), ctxPh = cPh.getContext('2d');
+        ctxPh.clearRect(0,0,cPh.width,cPh.height);
+        const cx = cPh.width/2, cy = cPh.height/2;
+        
+        ctxPh.setLineDash([4, 4]);
+        [100, 200, 230].forEach(v => { ctxPh.beginPath(); ctxPh.arc(cx, cy, v*scale, 0, Math.PI*2); ctxPh.strokeStyle="#ddd"; ctxPh.stroke(); });
+        ctxPh.setLineDash([]);
+
+        const Va = toRect(phases.va.mag, phases.va.deg), Vb = toRect(phases.vb.mag, phases.vb.deg), Vc = toRect(phases.vc.mag, phases.vc.deg);
+        const phData = [
+            {label: 'Va', final: Va, comps: [seq.v0, seq.v1, seq.v2]},
+            {label: 'Vb', final: Vb, comps: [seq.v0, mult(a2_op, seq.v1), mult(a_op, seq.v2)]},
+            {label: 'Vc', final: Vc, comps: [seq.v0, mult(a_op, seq.v1), mult(a2_op, seq.v2)]}
+        ];
+
+        phData.forEach(p => {
+            let kx = cx, ky = cy;
+            drawArrow(ctxPh, kx, ky, kx+p.comps[0].re*scale, ky-p.comps[0].im*scale, COLOR_ZERO, UNIFORM_WIDTH, true, 12);
+            kx += p.comps[0].re*scale; ky -= p.comps[0].im*scale;
+            drawArrow(ctxPh, kx, ky, kx+p.comps[1].re*scale, ky-p.comps[1].im*scale, COLOR_POS, UNIFORM_WIDTH, true, 12);
+            kx += p.comps[1].re*scale; ky -= p.comps[1].im*scale;
+            drawArrow(ctxPh, kx, ky, kx+p.comps[2].re*scale, ky-p.comps[2].im*scale, COLOR_NEG, UNIFORM_WIDTH, true, 12);
+            const endX = cx + p.final.re * scale, endY = cy - p.final.im * scale;
+            drawArrow(ctxPh, cx, cy, endX, endY, COLOR_FINAL, UNIFORM_WIDTH, true, 24);
+            ctxPh.fillStyle = COLOR_FINAL; ctxPh.font = "bold 16px Arial"; ctxPh.textAlign = "center";
+            ctxPh.fillText(p.label, endX + (p.final.re > 0 ? 15 : -15), endY + (p.final.im > 0 ? -15 : 15));
+            drawHandle(ctxPh, endX, endY);
+        });
+
+        drawSeq('canvasPos', [seq.v1, mult(a2_op, seq.v1), mult(a_op, seq.v1)], COLOR_POS, true);
+        drawSeq('canvasNeg', [seq.v2, mult(a_op, seq.v2), mult(a2_op, seq.v2)], COLOR_NEG, true);
+        drawSeqZero('canvasZero', seq.v0);
+
+        const v0p = toPol(seq.v0.re, seq.v0.im), v1p = toPol(seq.v1.re, seq.v1.im), v2p = toPol(seq.v2.re, seq.v2.im);
+        document.getElementById('results').innerHTML = `<b>V1:</b> ${v1p.mag.toFixed(1)}V | <b>V2:</b> ${v2p.mag.toFixed(1)}V | <b>V0:</b> ${v0p.mag.toFixed(1)}V`;
+    }
+
+    function drawSeq(id, vecs, color, handle) {
+        const c = document.getElementById(id), ctx = c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height);
+        const cx = c.width/2, cy = c.height/2;
+        const labels = id === 'canvasPos' ? ['Va1', 'Vb1', 'Vc1'] : ['Va2', 'Vb2', 'Vc2'];
+        
+        // رسم نقطة التقاط في المركز دائماً لتسهيل السحب من وضع الصفر
+        drawHandle(ctx, cx, cy, "rgba(0,0,0,0.05)");
+
+        vecs.forEach((v, i) => {
+            const ex = cx + v.re * scale, ey = cy - v.im * scale;
+            if (Math.hypot(v.re, v.im) > 1) {
+                drawArrow(ctx, cx, cy, ex, ey, color, UNIFORM_WIDTH, true, 24);
+                ctx.fillStyle = color; ctx.font = "14px Arial";
+                ctx.fillText(labels[i], ex + (v.re > 0 ? 10 : -10), ey + (v.im > 0 ? -10 : 10));
+            }
+            if(handle && i==0) drawHandle(ctx, ex, ey, "rgba(0,0,0,0.2)");
+        });
+    }
+
+    function drawSeqZero(id, v0) {
+        const c = document.getElementById(id), ctx = c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height);
+        const cx = c.width/2, cy = c.height/2;
+        drawHandle(ctx, cx, cy, "rgba(0,0,0,0.05)"); // نقطة المركز
+
+        const ang = Math.atan2(-v0.im, v0.re) + Math.PI/2;
+        for(let i=0; i<3; i++) {
+            const ox = cx + Math.cos(ang)*(i-1)*20, oy = cy + Math.sin(ang)*(i-1)*20;
+            const ex = ox + v0.re * scale, ey = oy - v0.im * scale;
+            if (Math.hypot(v0.re, v0.im) > 1) drawArrow(ctx, ox, oy, ex, ey, COLOR_ZERO, UNIFORM_WIDTH, true, 20);
+            if(i===0) drawHandle(ctx, ex, ey, "rgba(0,0,0,0.2)");
+        }
+    }
+
+    function drawArrow(ctx, x1, y1, x2, y2, color, width, head, hSize) {
+        ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = width; ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+        if(head) {
+            const ang = Math.atan2(y2-y1, x2-x1);
+            ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = width;
+            ctx.moveTo(x2, y2);
+            ctx.lineTo(x2 - hSize * Math.cos(ang - 0.35), y2 - hSize * Math.sin(ang - 0.35));
+            ctx.lineTo(x2 - hSize * Math.cos(ang + 0.35), y2 - hSize * Math.sin(ang + 0.35));
+            ctx.closePath(); ctx.stroke(); 
+        }
+    }
+
+    function resetToBalanced() {
+        phases = { va: {mag:230, deg:90}, vb: {mag:230, deg:-30}, vc: {mag:230, deg:210} };
+        calculateSequences(); update();
+    }
+
+    function applyFault(t) {
+        if(t==='LG'){ phases.va={mag:20, deg:90}; phases.vb={mag:230, deg:-30}; phases.vc={mag:230, deg:210}; }
+        else if(t==='LL'){ phases.va={mag:230, deg:90}; phases.vb={mag:115, deg:-90}; phases.vc={mag:115, deg:-90}; }
+        else if(t==='LLG'){ phases.va={mag:230, deg:90}; phases.vb={mag:50, deg:-40}; phases.vc={mag:50, deg:220}; }
+        else if(t==='3PH'){ phases.va={mag:80, deg:90}; phases.vb={mag:80, deg:-30}; phases.vc={mag:80, deg:210}; }
+        calculateSequences(); update();
+    }
+
+    function syncInputs() {
+        document.getElementById('va_m').value = Math.round(phases.va.mag); document.getElementById('va_a').value = Math.round(phases.va.deg);
+        document.getElementById('vb_m').value = Math.round(phases.vb.mag); document.getElementById('vb_a').value = Math.round(phases.vb.deg);
+        document.getElementById('vc_m').value = Math.round(phases.vc.mag); document.getElementById('vc_a').value = Math.round(phases.vc.deg);
+    }
+
+    function updateFromInputs() {
+        phases.va.mag = Number(document.getElementById('va_m').value); phases.va.deg = Number(document.getElementById('va_a').value);
+        phases.vb.mag = Number(document.getElementById('vb_m').value); phases.vb.deg = Number(document.getElementById('vb_a').value);
+        phases.vc.mag = Number(document.getElementById('vc_m').value); phases.vc.deg = Number(document.getElementById('vc_a').value);
+        calculateSequences(); update();
+    }
+
+    function resize() {
+        document.querySelectorAll('canvas').forEach(c => { c.width=c.parentElement.clientWidth; c.height=c.parentElement.clientHeight; });
+        scale = (Math.min(window.innerWidth, window.innerHeight)/5.0)/maxVoltageForScale;
+        update();
+    }
+    init();
+</script>
+</body>
+</html>
